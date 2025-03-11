@@ -24,7 +24,7 @@ faulthandler.enable()
 class Args:
     # Hardware parameters
     left_camera_id: str = "25455306" # e.g., "24259877"
-    right_camera_id: str = "27085680"  # e.g., "24514023"
+    right_camera_id: str = "27085680" # "27085680" # "26368109"  
     wrist_camera_id: str = "14436910"  # e.g., "13062452"
 
     # Policy parameters
@@ -33,7 +33,7 @@ class Args:
     )
 
     # Rollout parameters
-    max_timesteps: int = 500
+    max_timesteps: int = 800
     # How many actions to execute from a predicted action chunk before querying policy server again
     # 8 is usually a good default (equals 0.5 seconds of action execution).
     open_loop_horizon: int = 8
@@ -43,6 +43,9 @@ class Args:
     remote_port: int = (
         8000  # point this to the port of the policy server, default server port for openpi servers is 8000
     )
+
+    # Evaluation parameters
+    eval_name: str = "default"  # Name for this evaluation session
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -81,7 +84,21 @@ def main(args: Args):
     # Connect to the policy server
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
 
-    df = pd.DataFrame(columns=["success", "duration", "video_filename"])
+    # Initialize DataFrame and prepare markdown logging
+    df = pd.DataFrame(columns=["success", "duration", "video_filename", "instruction", "comment"])
+    timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H%M")
+    date = datetime.datetime.now().strftime("%m%d")
+    # Get main category for this evaluation session
+    main_category = input("Enter main category for this evaluation session: ")
+    os.makedirs(f"results/log/{date}", exist_ok=True)
+    markdown_file = f"results/log/{date}/eval_{main_category}.md"
+
+
+    # Create markdown header
+    with open(markdown_file, "a") as f:
+        f.write(f"# Pi0-FAST Evaluation: {main_category}\n")
+        f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+        f.write("## Results\n\n")
 
     while True:
         instruction = input("Enter instruction: ")
@@ -92,20 +109,29 @@ def main(args: Args):
 
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
+
+        joint_position_file = f"results/log/{date}/eval_{main_category}_{timestamp}_joints.csv"
+        # Create a filename-safe version of the instruction
+        safe_instruction = instruction.replace(" ", "_").replace("/", "_").replace("\\", "_")[:50]  # limit length
         video = []
+        wrist_video = []  # New list for wrist camera frames
+        #joint_positions = []
+        #action_state = []
+
+
         bar = tqdm.tqdm(range(args.max_timesteps))
         print("Running rollout... press Ctrl+C to stop early.")
         for t_step in bar:
             try:
-                # Get the current observation
                 curr_obs = _extract_observation(
                     args,
                     env.get_observation(),
-                    # Save the first observation to disk
                     save_to_disk=t_step == 0,
                 )
-
+                # Save both camera views
                 video.append(curr_obs[f"{args.external_camera}_image"])
+                wrist_video.append(curr_obs["wrist_image"])
+
 
                 # Send websocket request to policy server if it's time to predict a new chunk
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
@@ -145,46 +171,90 @@ def main(args: Args):
                 # clip all dimensions of action to [-1, 1]
                 action = np.clip(action, -1, 1)
 
+                #action_state.append(action)
+                #joint_positions.append(curr_obs["joint_position"])
+
                 env.step(action)
             except KeyboardInterrupt:
                 break
 
+        # Stack videos side by side
         video = np.stack(video)
-        save_filename = "video_" + timestamp
-        ImageSequenceClip(list(video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
+        wrist_video = np.stack(wrist_video)
+        #action_csv = np.stack(action_state)
+        #joint_csv = np.stack(joint_positions)
+        #combined_action_csv = np.concatenate([action_csv, joint_csv], axis=1)
+        
+        # Ensure both videos have the same height for side-by-side display
+        target_height = min(video.shape[1], wrist_video.shape[1])
+        target_width = min(video.shape[2], wrist_video.shape[2])
+        
+        # Resize both videos to the same dimensions
+        video_resized = np.array([image_tools.resize_with_pad(frame, target_height, target_width) for frame in video])
+        wrist_video_resized = np.array([image_tools.resize_with_pad(frame, target_height, target_width) for frame in wrist_video])
+        
+        # Stack videos horizontally
+        combined_video = np.concatenate([video_resized, wrist_video_resized], axis=2)
 
+        date = datetime.datetime.now().strftime("%m%d")
+        save_dir = f"results/videos/{date}"
+        os.makedirs(save_dir, exist_ok=True)
+        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{timestamp}.mp4")
+  
+        ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
+
+        # Get success value
         success: str | float | None = None
         while not isinstance(success, float):
             success = input(
-                "Did the rollout succeed? (enter y for 100%, n for 0%), or a numeric value 0-100 based on the evaluation spec"
+                "Did the rollout succeed? (enter y for 100%, n for 0%), or a numeric value 0-100 based on the evaluation spec: "
             )
             if success == "y":
                 success = 1.0
             elif success == "n":
                 success = 0.0
+            else:
+                try:
+                    success = float(success) / 100
+                    if not (0 <= success <= 1):
+                        print(f"Success must be a number in [0, 100] but got: {success * 100}")
+                        success = None
+                except ValueError:
+                    print("Invalid input. Please enter y, n, or a number between 0-100")
+                    success = None
 
-            success = float(success) / 100
-            if not (0 <= success <= 1):
-                print(f"Success must be a number in [0, 100] but got: {success * 100}")
+        # Get comment about the result
+        comment = input("Enter comment about this trial: ")
 
-        df = df.append(
-            {
-                "success": success,
-                "duration": t_step,
-                "video_filename": save_filename,
-            },
-            ignore_index=True,
-        )
+        # Append to markdown file
+        with open(markdown_file, "a") as f:
+            f.write(f"### Trial {len(df) + 1}: {instruction}\n")
+            f.write(f"- Success: {success * 100}%\n")
+            f.write(f"- Duration: {t_step} steps\n")
+            f.write(f"- Video: [{os.path.basename(save_filename)}]({save_filename})\n")
+            f.write(f"- Comment: {comment}\n\n")
+
+
+        #joint_df = pd.DataFrame(combined_action_csv)
+        #joint_df.to_csv(joint_position_file)
+
+        # Update DataFrame
+        df = pd.concat([df, pd.DataFrame([{
+            "success": success,
+            "duration": t_step,
+            "video_filename": save_filename,
+            "instruction": instruction,
+            "comment": comment
+        }])], ignore_index=True)
 
         if input("Do one more eval? (enter y or n) ").lower() != "y":
             break
         env.reset()
 
-    os.makedirs("results", exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
-    csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
+    # Save CSV alongside markdown
+    csv_filename = markdown_file.replace(".md", ".csv")
     df.to_csv(csv_filename)
-    print(f"Results saved to {csv_filename}")
+    print(f"Results saved to {markdown_file} and {csv_filename}")
 
 
 def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
