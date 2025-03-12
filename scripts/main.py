@@ -6,6 +6,9 @@ import datetime
 import faulthandler
 import os
 import signal
+import json  # Added for JSON export
+import threading  # Added for non-blocking visualization
+import time
 
 from moviepy.editor import ImageSequenceClip
 import numpy as np
@@ -16,6 +19,10 @@ from PIL import Image
 from droid.robot_env import RobotEnv
 import tqdm
 import tyro
+import matplotlib.pyplot as plt  # Added for visualization
+import matplotlib.animation as animation  # Added for dynamic updates
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 faulthandler.enable()
 
@@ -24,7 +31,7 @@ faulthandler.enable()
 class Args:
     # Hardware parameters
     left_camera_id: str = "25455306" # e.g., "24259877"
-    right_camera_id: str = "27085680" # "27085680" # "26368109"  
+    right_camera_id: str = "26368109" # fix: "27085680"  move: # "26368109"  
     wrist_camera_id: str = "14436910"  # e.g., "13062452"
 
     # Policy parameters
@@ -68,6 +75,18 @@ def prevent_keyboard_interrupt():
         signal.signal(signal.SIGINT, original_handler)
         if interrupted:
             raise KeyboardInterrupt
+
+
+def save_visualization_snapshot(fig, save_path):
+    """Save a snapshot of the current visualization figure."""
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        # Save the figure
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Visualization snapshot saved to {save_path}")
+    except Exception as e:
+        print(f"Failed to save visualization snapshot: {e}")
 
 
 def main(args: Args):
@@ -115,9 +134,69 @@ def main(args: Args):
         safe_instruction = instruction.replace(" ", "_").replace("/", "_").replace("\\", "_")[:50]  # limit length
         video = []
         wrist_video = []  # New list for wrist camera frames
-        #joint_positions = []
-        #action_state = []
-
+        
+        # Add data storage for plotting and JSON history
+        joint_positions = []
+        action_history = []
+        action_chunks_history = []  # To store action trunk history
+        chunk_timestamps = []  # When each chunk was received
+        current_chunk_index = -1  # Track which chunk we're in
+        
+        # Setup visualization
+        plt.ion()  # Turn on interactive mode for live updates
+        fig, axs = plt.subplots(3, 1, figsize=(10, 12))  # 3 subplots instead of 2
+        fig.suptitle(f"Instruction: {instruction}", fontsize=12)
+        
+        # First subplot for joint positions
+        joint_pos_lines = []
+        for i in range(7):  # 7 joint positions
+            line, = axs[0].plot([], [], label=f'Joint {i+1}')
+            joint_pos_lines.append(line)
+        axs[0].set_title('Joint Positions')
+        axs[0].set_xlabel('Timestep')
+        axs[0].set_ylabel('Position')
+        axs[0].legend(loc='upper left', fontsize='small')
+        
+        # Second subplot for velocity actions
+        action_lines = []
+        for i in range(7):  # 7 joint velocity actions
+            line, = axs[1].plot([], [], label=f'Joint {i+1} Velocity')
+            action_lines.append(line)
+        axs[1].set_title('Joint Velocity Actions')
+        axs[1].set_xlabel('Timestep')
+        axs[1].set_ylabel('Action Value')
+        axs[1].legend(loc='upper left', fontsize='small')
+        
+        # Third subplot for gripper state
+        gripper_action_line, = axs[2].plot([], [], 'r-', linewidth=2, label='Gripper Action')
+        gripper_position_line, = axs[2].plot([], [], 'b-', linewidth=2, label='Gripper Position')
+        axs[2].set_title('Gripper State')
+        axs[2].set_xlabel('Timestep')
+        axs[2].set_ylabel('Value [0-1]')
+        axs[2].set_ylim(-0.1, 1.1)  # Gripper values are between 0 and 1
+        axs[2].legend(loc='upper left', fontsize='small')
+        
+        # Text area for real-time statistics
+        status_text = axs[0].text(0.78, 0.95, '', transform=axs[0].transAxes, 
+                                 verticalalignment='top', horizontalalignment='right',
+                                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Add vertical lines to mark chunk boundaries (will be added during execution)
+        chunk_boundary_lines = []
+        
+        # Initialize plot with empty data
+        xdata = []
+        joint_ydata = [[] for _ in range(7)]
+        action_ydata = [[] for _ in range(8)]  # 8th is gripper
+        gripper_action_ydata = []
+        gripper_position_ydata = []
+        early_stop_markers = []  # Store early stop timesteps
+        
+        plt.tight_layout()
+        plt.show(block=False)
+        
+        # Start time for execution metrics
+        start_time = time.time()
 
         bar = tqdm.tqdm(range(args.max_timesteps))
         print("Running rollout... press Ctrl+C to stop early.")
@@ -131,11 +210,14 @@ def main(args: Args):
                 # Save both camera views
                 video.append(curr_obs[f"{args.external_camera}_image"])
                 wrist_video.append(curr_obs["wrist_image"])
-
+                
+                # Store joint positions for visualization
+                joint_positions.append(curr_obs["joint_position"])
 
                 # Send websocket request to policy server if it's time to predict a new chunk
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     actions_from_chunk_completed = 0
+                    current_chunk_index += 1
 
                     # We resize images on the robot laptop to minimize the amount of data sent to the policy server
                     # and improve latency.
@@ -151,10 +233,28 @@ def main(args: Args):
 
                     # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
                     # Ctrl+C will be handled after the server call is complete
+                    server_request_start = time.time()
                     with prevent_keyboard_interrupt():
                         # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
                         pred_action_chunk = policy_client.infer(request_data)["actions"]
+                    server_request_duration = time.time() - server_request_start
                     assert pred_action_chunk.shape == (10, 8)
+                    
+                    # Record the action chunk in history with timestep and timing information
+                    action_chunks_history.append({
+                        "chunk_index": current_chunk_index,
+                        "timestep": t_step,
+                        "time": time.time() - start_time,
+                        "server_request_duration": server_request_duration,
+                        "chunk": pred_action_chunk.tolist(),  # Convert numpy array to list for JSON serialization
+                    })
+                    chunk_timestamps.append(t_step)
+                    
+                    # Add vertical line to mark chunk boundary on the plot
+                    for ax in axs:
+                        # Add a vertical line at this timestep to show when a new chunk was received
+                        line = ax.axvline(x=t_step, color='r', linestyle='--', alpha=0.5)
+                        chunk_boundary_lines.append(line)
 
                 # Select current action to execute from chunk
                 action = pred_action_chunk[actions_from_chunk_completed]
@@ -170,20 +270,192 @@ def main(args: Args):
 
                 # clip all dimensions of action to [-1, 1]
                 action = np.clip(action, -1, 1)
-
-                #action_state.append(action)
-                #joint_positions.append(curr_obs["joint_position"])
+                
+                # Check for "early stopping" pattern - when all joint velocities are zero
+                joint_velocities = action[:-1]  # All except gripper
+                if np.all(np.abs(joint_velocities) < 1e-2):  # Check if all joint velocities are essentially zero
+                    print(f"Possible early stopping detected at timestep {t_step}, chunk {current_chunk_index}, action {actions_from_chunk_completed-1}")
+                    # Record this event in action record for later analysis
+                    is_early_stop = True
+                    early_stop_markers.append(t_step)
+                else:
+                    is_early_stop = False
+                
+                # Store action for history and visualization
+                action_record = {
+                    "timestep": t_step,
+                    "time": time.time() - start_time,
+                    "chunk_index": current_chunk_index,
+                    "action_index_in_chunk": actions_from_chunk_completed - 1,
+                    "action": action.tolist(),
+                    "joint_position": curr_obs["joint_position"].tolist(),
+                    "gripper_position": curr_obs["gripper_position"].tolist(),
+                    "is_early_stop": is_early_stop
+                }
+                action_history.append(action_record)
+                
+                # Update visualization data
+                xdata.append(t_step)
+                
+                # Joint positions data
+                for i in range(7):
+                    joint_ydata[i].append(curr_obs["joint_position"][i])
+                
+                # Action data (joint velocities and gripper)
+                for i in range(7):  # Only the 7 joint velocity actions
+                    action_ydata[i].append(action[i])
+                action_ydata[7].append(action[7])  # Gripper action
+                
+                # Update gripper data
+                gripper_action_ydata.append(action[7])
+                gripper_position_ydata.append(curr_obs["gripper_position"][0])  # Use actual gripper position
+                
+                # Update plot every 5 timesteps to avoid slowing down execution
+                if t_step % 5 == 0:
+                    # Update joint position lines
+                    for i, line in enumerate(joint_pos_lines):
+                        line.set_data(xdata, joint_ydata[i])
+                    
+                    # Update action lines (only joint velocities)
+                    for i, line in enumerate(action_lines):
+                        if i < len(action_ydata) - 1:  # Skip gripper in action lines
+                            line.set_data(xdata, action_ydata[i])
+                    
+                    # Update gripper lines
+                    gripper_action_line.set_data(xdata, gripper_action_ydata)
+                    gripper_position_line.set_data(xdata, gripper_position_ydata)
+                    
+                    # Update early stop markers
+                    for ax in axs:
+                        # Clear any existing early stop markers
+                        for artist in ax.findobj(match=lambda x: hasattr(x, 'early_stop_marker')):
+                            artist.remove()
+                    
+                    # Add new markers for early stops
+                    for stop_time in early_stop_markers:
+                        for ax in axs:
+                            marker = ax.axvline(x=stop_time, color='green', linestyle='-.', linewidth=2, alpha=0.7)
+                            marker.early_stop_marker = True  # Tag it for later removal
+                    
+                    # Update status text
+                    current_time = time.time() - start_time
+                    status_text.set_text(f"Timestep: {t_step}\n"
+                                        f"Time: {current_time:.2f}s\n"
+                                        f"Chunk: {current_chunk_index}\n"
+                                        f"Action in chunk: {actions_from_chunk_completed-1}/8\n"
+                                        f"Early stops: {len(early_stop_markers)}")
+                    
+                    # Rescale axes
+                    for ax in axs:
+                        ax.relim()
+                        ax.autoscale_view()
+                    
+                    # Draw and refresh plot
+                    fig.canvas.draw_idle()
+                    fig.canvas.flush_events()
 
                 env.step(action)
             except KeyboardInterrupt:
                 break
 
+        # Final execution time
+        total_execution_time = time.time() - start_time
+        
+        # Analyze early stopping patterns
+        if early_stop_markers:
+            # Count early stops at the beginning of chunks
+            beginning_chunk_stops = sum(1 for t in early_stop_markers 
+                                      if t in chunk_timestamps)
+            
+            # Count early stops at the end of chunks
+            chunk_end_stops = 0
+            for i, chunk_start in enumerate(chunk_timestamps):
+                if i < len(chunk_timestamps)-1:
+                    # Check if stop happened just before next chunk
+                    chunk_end = chunk_timestamps[i+1] - 1
+                    chunk_end_stops += sum(1 for t in early_stop_markers 
+                                         if t == chunk_end)
+                else:
+                    # Last chunk
+                    pass
+            
+            print("\nEarly stopping analysis:")
+            print(f"  Total early stops: {len(early_stop_markers)}")
+            print(f"  Stops at chunk beginnings: {beginning_chunk_stops} ({beginning_chunk_stops/len(early_stop_markers)*100:.1f}%)")
+            print(f"  Stops at chunk ends: {chunk_end_stops} ({chunk_end_stops/len(early_stop_markers)*100:.1f}%)")
+            print(f"  Other positions: {len(early_stop_markers) - beginning_chunk_stops - chunk_end_stops}")
+            
+            # Look at positions within chunks
+            chunk_positions = {}
+            for t in early_stop_markers:
+                # Find which chunk this belongs to
+                chunk_idx = -1
+                pos_in_chunk = -1
+                for i, chunk_start in enumerate(chunk_timestamps):
+                    if i < len(chunk_timestamps)-1:
+                        if chunk_start <= t < chunk_timestamps[i+1]:
+                            chunk_idx = i
+                            pos_in_chunk = t - chunk_start
+                            break
+                    else:
+                        # Last chunk
+                        if chunk_start <= t:
+                            chunk_idx = i
+                            pos_in_chunk = t - chunk_start
+                
+                if pos_in_chunk != -1:
+                    if pos_in_chunk not in chunk_positions:
+                        chunk_positions[pos_in_chunk] = 0
+                    chunk_positions[pos_in_chunk] += 1
+            
+            print("\nPositions within chunks where early stops occur:")
+            for pos, count in sorted(chunk_positions.items()):
+                print(f"  Position {pos}: {count} stops ({count/len(early_stop_markers)*100:.1f}%)")
+        
+        # Save a snapshot of the visualization before closing
+        vis_snapshot_path = f"results/log/{date}/eval_{main_category}_{timestamp}_visualization.png"
+        save_visualization_snapshot(fig, vis_snapshot_path)
+        
+        # Close the plot after the rollout
+        plt.close(fig)
+        
+        # Save action trunk history to JSON
+        action_history_file = f"results/log/{date}/eval_{main_category}_{timestamp}_action_history.json"
+        
+        # Include all relevant metadata
+        action_history_data = {
+            "metadata": {
+                "instruction": instruction,
+                "timestamp": timestamp,
+                "date": date,
+                "category": main_category,
+                "total_timesteps": t_step + 1,
+                "total_execution_time": total_execution_time,
+                "open_loop_horizon": args.open_loop_horizon,
+                "external_camera": args.external_camera,
+                "left_camera_id": args.left_camera_id,
+                "right_camera_id": args.right_camera_id,
+                "wrist_camera_id": args.wrist_camera_id,
+                "remote_host": args.remote_host,
+                "remote_port": args.remote_port
+            },
+            "action_chunks": action_chunks_history,
+            "chunk_timestamps": chunk_timestamps,
+            "early_stops": {
+                "count": len(early_stop_markers),
+                "timesteps": early_stop_markers
+            },
+            "detailed_actions": action_history
+        }
+        
+        with open(action_history_file, 'w') as f:
+            json.dump(action_history_data, f, indent=2)
+        
+        print(f"Action trunk history saved to {action_history_file}")
+
         # Stack videos side by side
         video = np.stack(video)
         wrist_video = np.stack(wrist_video)
-        #action_csv = np.stack(action_state)
-        #joint_csv = np.stack(joint_positions)
-        #combined_action_csv = np.concatenate([action_csv, joint_csv], axis=1)
         
         # Ensure both videos have the same height for side-by-side display
         target_height = min(video.shape[1], wrist_video.shape[1])
@@ -209,10 +481,12 @@ def main(args: Args):
             success = input(
                 "Did the rollout succeed? (enter y for 100%, n for 0%), or a numeric value 0-100 based on the evaluation spec: "
             )
-            if success == "y":
+            if success == "y" or success == "1":
                 success = 1.0
-            elif success == "n":
+            elif success == "n" or success == "0":
                 success = 0.0
+            elif success == "-1":
+                success = -1  #\
             else:
                 try:
                     success = float(success) / 100
@@ -234,9 +508,6 @@ def main(args: Args):
             f.write(f"- Video: [{os.path.basename(save_filename)}]({save_filename})\n")
             f.write(f"- Comment: {comment}\n\n")
 
-
-        #joint_df = pd.DataFrame(combined_action_csv)
-        #joint_df.to_csv(joint_position_file)
 
         # Update DataFrame
         df = pd.concat([df, pd.DataFrame([{
