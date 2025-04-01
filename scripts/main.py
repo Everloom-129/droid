@@ -15,7 +15,7 @@ import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageDraw
 from droid.robot_env import RobotEnv
 import tqdm
 import tyro
@@ -23,15 +23,31 @@ import matplotlib.pyplot as plt  # Added for visualization
 import matplotlib.animation as animation  # Added for dynamic updates
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+import cv2  # Add cv2 to the imports
 
 faulthandler.enable()
+
+
+# Define a custom JSON encoder to handle NumPy types
+class NumpyJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder that can handle NumPy types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
 
 
 @dataclasses.dataclass
 class Args:
     # Hardware parameters
     left_camera_id: str = "25455306" # e.g., "24259877"
-    right_camera_id: str = "26368109" # fix: "27085680"  move: # "26368109"  
+    right_camera_id: str = "27085680" # fix: "27085680"  move: # "26368109"  
     wrist_camera_id: str = "14436910"  # e.g., "13062452"
 
     # Policy parameters
@@ -111,7 +127,8 @@ def main(args: Args):
     main_category = input("Enter main category for this evaluation session: ")
     os.makedirs(f"results/log/{date}", exist_ok=True)
     markdown_file = f"results/log/{date}/eval_{main_category}.md"
-
+    os.makedirs(f"results/log/{date}/action_plot/{main_category}", exist_ok=True)
+    os.makedirs(f"results/log/{date}/action_json/{main_category}", exist_ok=True)
 
     # Create markdown header
     with open(markdown_file, "a") as f:
@@ -129,7 +146,6 @@ def main(args: Args):
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
 
-        joint_position_file = f"results/log/{date}/eval_{main_category}_{timestamp}_joints.csv"
         # Create a filename-safe version of the instruction
         safe_instruction = instruction.replace(" ", "_").replace("/", "_").replace("\\", "_")[:50]  # limit length
         video = []
@@ -190,7 +206,6 @@ def main(args: Args):
         action_ydata = [[] for _ in range(8)]  # 8th is gripper
         gripper_action_ydata = []
         gripper_position_ydata = []
-        early_stop_markers = []  # Store early stop timesteps
         
         plt.tight_layout()
         plt.show(block=False)
@@ -206,9 +221,31 @@ def main(args: Args):
                     args,
                     env.get_observation(),
                     save_to_disk=t_step == 0,
+                    main_category=main_category,
+                    instruction=instruction,
+                    date=date,
                 )
                 # Save both camera views
-                video.append(curr_obs[f"{args.external_camera}_image"])
+                # Add instruction text to external camera image
+                camera_image = curr_obs[f"{args.external_camera}_image"].copy()
+                
+                display_text = instruction[:50] + "..." if len(instruction) > 50 else instruction
+                text_position = (10, 30)  
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1.2
+                font_color = (255, 255, 255)   
+                font_thickness = 2
+                
+                # Add black outline/shadow for better visibility against any background
+                cv2.putText(camera_image, display_text, text_position, font, font_scale, 
+                           (0, 0, 0), font_thickness + 2)
+                
+                # Draw the main text in white
+                cv2.putText(camera_image, display_text, text_position, font, font_scale, 
+                           font_color, font_thickness)
+                
+                video.append(camera_image)
+                
                 wrist_video.append(curr_obs["wrist_image"])
                 
                 # Store joint positions for visualization
@@ -218,7 +255,6 @@ def main(args: Args):
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     actions_from_chunk_completed = 0
                     current_chunk_index += 1
-
                     # We resize images on the robot laptop to minimize the amount of data sent to the policy server
                     # and improve latency.
                     request_data = {
@@ -271,16 +307,6 @@ def main(args: Args):
                 # clip all dimensions of action to [-1, 1]
                 action = np.clip(action, -1, 1)
                 
-                # Check for "early stopping" pattern - when all joint velocities are zero
-                joint_velocities = action[:-1]  # All except gripper
-                if np.all(np.abs(joint_velocities) < 1e-2):  # Check if all joint velocities are essentially zero
-                    print(f"Possible early stopping detected at timestep {t_step}, chunk {current_chunk_index}, action {actions_from_chunk_completed-1}")
-                    # Record this event in action record for later analysis
-                    is_early_stop = True
-                    early_stop_markers.append(t_step)
-                else:
-                    is_early_stop = False
-                
                 # Store action for history and visualization
                 action_record = {
                     "timestep": t_step,
@@ -289,8 +315,7 @@ def main(args: Args):
                     "action_index_in_chunk": actions_from_chunk_completed - 1,
                     "action": action.tolist(),
                     "joint_position": curr_obs["joint_position"].tolist(),
-                    "gripper_position": curr_obs["gripper_position"].tolist(),
-                    "is_early_stop": is_early_stop
+                    "gripper_position": curr_obs["gripper_position"].tolist()
                 }
                 action_history.append(action_record)
                 
@@ -325,25 +350,12 @@ def main(args: Args):
                     gripper_action_line.set_data(xdata, gripper_action_ydata)
                     gripper_position_line.set_data(xdata, gripper_position_ydata)
                     
-                    # Update early stop markers
-                    for ax in axs:
-                        # Clear any existing early stop markers
-                        for artist in ax.findobj(match=lambda x: hasattr(x, 'early_stop_marker')):
-                            artist.remove()
-                    
-                    # Add new markers for early stops
-                    for stop_time in early_stop_markers:
-                        for ax in axs:
-                            marker = ax.axvline(x=stop_time, color='green', linestyle='-.', linewidth=2, alpha=0.7)
-                            marker.early_stop_marker = True  # Tag it for later removal
-                    
                     # Update status text
                     current_time = time.time() - start_time
                     status_text.set_text(f"Timestep: {t_step}\n"
                                         f"Time: {current_time:.2f}s\n"
                                         f"Chunk: {current_chunk_index}\n"
-                                        f"Action in chunk: {actions_from_chunk_completed-1}/8\n"
-                                        f"Early stops: {len(early_stop_markers)}")
+                                        f"Action in chunk: {actions_from_chunk_completed-1}/8\n")
                     
                     # Rescale axes
                     for ax in axs:
@@ -354,73 +366,22 @@ def main(args: Args):
                     fig.canvas.draw_idle()
                     fig.canvas.flush_events()
 
-                env.step(action)
+                env.step(action) # droid actually apply the action
             except KeyboardInterrupt:
                 break
 
         # Final execution time
         total_execution_time = time.time() - start_time
         
-        # Analyze early stopping patterns
-        if early_stop_markers:
-            # Count early stops at the beginning of chunks
-            beginning_chunk_stops = sum(1 for t in early_stop_markers 
-                                      if t in chunk_timestamps)
-            
-            # Count early stops at the end of chunks
-            chunk_end_stops = 0
-            for i, chunk_start in enumerate(chunk_timestamps):
-                if i < len(chunk_timestamps)-1:
-                    # Check if stop happened just before next chunk
-                    chunk_end = chunk_timestamps[i+1] - 1
-                    chunk_end_stops += sum(1 for t in early_stop_markers 
-                                         if t == chunk_end)
-                else:
-                    # Last chunk
-                    pass
-            
-            print("\nEarly stopping analysis:")
-            print(f"  Total early stops: {len(early_stop_markers)}")
-            print(f"  Stops at chunk beginnings: {beginning_chunk_stops} ({beginning_chunk_stops/len(early_stop_markers)*100:.1f}%)")
-            print(f"  Stops at chunk ends: {chunk_end_stops} ({chunk_end_stops/len(early_stop_markers)*100:.1f}%)")
-            print(f"  Other positions: {len(early_stop_markers) - beginning_chunk_stops - chunk_end_stops}")
-            
-            # Look at positions within chunks
-            chunk_positions = {}
-            for t in early_stop_markers:
-                # Find which chunk this belongs to
-                chunk_idx = -1
-                pos_in_chunk = -1
-                for i, chunk_start in enumerate(chunk_timestamps):
-                    if i < len(chunk_timestamps)-1:
-                        if chunk_start <= t < chunk_timestamps[i+1]:
-                            chunk_idx = i
-                            pos_in_chunk = t - chunk_start
-                            break
-                    else:
-                        # Last chunk
-                        if chunk_start <= t:
-                            chunk_idx = i
-                            pos_in_chunk = t - chunk_start
-                
-                if pos_in_chunk != -1:
-                    if pos_in_chunk not in chunk_positions:
-                        chunk_positions[pos_in_chunk] = 0
-                    chunk_positions[pos_in_chunk] += 1
-            
-            print("\nPositions within chunks where early stops occur:")
-            for pos, count in sorted(chunk_positions.items()):
-                print(f"  Position {pos}: {count} stops ({count/len(early_stop_markers)*100:.1f}%)")
-        
         # Save a snapshot of the visualization before closing
-        vis_snapshot_path = f"results/log/{date}/eval_{main_category}_{timestamp}_visualization.png"
+        vis_snapshot_path = f"results/log/{date}/action_plot/{main_category}/eval_{instruction}_visualization.png"
         save_visualization_snapshot(fig, vis_snapshot_path)
         
         # Close the plot after the rollout
         plt.close(fig)
         
         # Save action trunk history to JSON
-        action_history_file = f"results/log/{date}/eval_{main_category}_{timestamp}_action_history.json"
+        action_history_file = f"results/log/{date}/action_json/{main_category}/eval_{instruction}_action_history.json"
         
         # Include all relevant metadata
         action_history_data = {
@@ -440,16 +401,12 @@ def main(args: Args):
                 "remote_port": args.remote_port
             },
             "action_chunks": action_chunks_history,
-            "chunk_timestamps": chunk_timestamps,
-            "early_stops": {
-                "count": len(early_stop_markers),
-                "timesteps": early_stop_markers
-            },
+            "chunk_timestamps": [int(t) for t in chunk_timestamps],
             "detailed_actions": action_history
         }
         
         with open(action_history_file, 'w') as f:
-            json.dump(action_history_data, f, indent=2)
+            json.dump(action_history_data, f, indent=2, cls=NumpyJSONEncoder)
         
         print(f"Action trunk history saved to {action_history_file}")
 
@@ -469,11 +426,11 @@ def main(args: Args):
         combined_video = np.concatenate([video_resized, wrist_video_resized], axis=2)
 
         date = datetime.datetime.now().strftime("%m%d")
-        save_dir = f"results/videos/{date}"
+        save_dir = f"results/videos/{date}/{main_category}"
         os.makedirs(save_dir, exist_ok=True)
-        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{timestamp}.mp4")
+        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{date}.mp4")
   
-        ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
+        ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename, codec="libx264")
 
         # Get success value
         success: str | float | None = None
@@ -528,7 +485,7 @@ def main(args: Args):
     print(f"Results saved to {markdown_file} and {csv_filename}")
 
 
-def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
+def _extract_observation(args: Args, obs_dict, *, save_to_disk=False, main_category=None, instruction=None, date=None):
     image_observations = obs_dict["image"]
     left_image, right_image, wrist_image = None, None, None
     for key in image_observations:
@@ -563,6 +520,8 @@ def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
         combined_image = np.concatenate([left_image, wrist_image, right_image], axis=1)
         combined_image = Image.fromarray(combined_image)
         combined_image.save("robot_camera_views.png")
+        
+        combined_image.save(f"results/log/{date}/view_{main_category}_{instruction}.png")
 
     return {
         "left_image": left_image,
