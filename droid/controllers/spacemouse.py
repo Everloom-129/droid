@@ -189,8 +189,8 @@ class SpaceMouseInterface:
         self,
         vendor_id=0x256f,  # Bus 003 Device 043
         product_id=0xc635, # 3Dconnexion SpaceMouse Compact
-        pos_sensitivity=0.5,
-        rot_sensitivity=2.0,
+        pos_sensitivity=5,
+        rot_sensitivity=5,
         action_scale=0.08,
     ):
         print("Opening SpaceMouse device")
@@ -402,10 +402,20 @@ class SpaceMouseInterface:
         self.debug = enable
         print(f"Debug mode {'enabled' if enable else 'disabled'}")
         
+        # Dump current state
+        if enable:
+            print("\nCURRENT STATE:")
+            print(f"Position control: {self._control[:3]}")
+            print(f"Rotation control: {self._control[3:]}")
+            print(f"Gripper is closed: {self.gripper_is_closed} (returns {int(self.gripper_is_closed)})")
+            print(f"Current grasp command: {self.control_gripper} (returned to teleop)")
+            print(f"Single click hold: {self.single_click_and_hold}")
+            print(f"Lock state: {self.lock_state}")
+            print("\nWAITING FOR INPUT - move mouse or press buttons...")
+            
         # Capture and print a few raw packets to understand the data structure
         if enable:
-            print("Capturing raw data packets. Move the mouse and press buttons...")
-            for i in range(10):
+            for i in range(5):
                 d = self.device.read(13)
                 if d is not None:
                     print(f"Packet {i}: {d}")

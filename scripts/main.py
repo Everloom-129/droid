@@ -374,14 +374,14 @@ def main(args: Args):
         total_execution_time = time.time() - start_time
         
         # Save a snapshot of the visualization before closing
-        vis_snapshot_path = f"results/log/{date}/action_plot/{main_category}/eval_{instruction}_visualization.png"
+        vis_snapshot_path = f"results/log/{date}/action_plot/{main_category}/eval_{instruction}_visualization_{timestamp}.png"
         save_visualization_snapshot(fig, vis_snapshot_path)
         
         # Close the plot after the rollout
         plt.close(fig)
         
         # Save action trunk history to JSON
-        action_history_file = f"results/log/{date}/action_json/{main_category}/eval_{instruction}_action_history.json"
+        action_history_file = f"results/log/{date}/action_json/{main_category}/eval_{instruction}_action_history_{timestamp}.json"
         
         # Include all relevant metadata
         action_history_data = {
@@ -428,7 +428,7 @@ def main(args: Args):
         date = datetime.datetime.now().strftime("%m%d")
         save_dir = f"results/videos/{date}/{main_category}"
         os.makedirs(save_dir, exist_ok=True)
-        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{date}.mp4")
+        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{timestamp}.mp4")
   
         ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename, codec="libx264")
 

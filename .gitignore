@@ -42,3 +42,5 @@ coverage.xml
 
 # Project specific
 results/
+results_regent*
+results_rnp*
