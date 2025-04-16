@@ -1,3 +1,6 @@
+# The saving of all the instructions is not perfect
+# This started as the main.py for droid on the 457 Franka laptop.
+# I am now going to update it to let me do real-time prompt revision.
 # ruff: noqa
 
 import contextlib
@@ -9,13 +12,14 @@ import signal
 import json  # Added for JSON export
 import threading  # Added for non-blocking visualization
 import time
+import cv2
 
 from moviepy.editor import ImageSequenceClip
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 import pandas as pd
-from PIL import Image, ImageDraw
+from PIL import Image
 from droid.robot_env import RobotEnv
 import tqdm
 import tyro
@@ -23,10 +27,23 @@ import matplotlib.pyplot as plt  # Added for visualization
 import matplotlib.animation as animation  # Added for dynamic updates
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
-import cv2  # Add cv2 to the imports
 
 faulthandler.enable()
 
+
+def deduplicated_list(lst):
+    """Remove duplicates from a list while preserving order."""
+    seen = set()
+    new_list = []
+    for e in lst:
+        if e not in seen:
+            seen.add(e)
+            new_list.append(e)
+    return new_list
+
+def list_to_str(lst, sep="_X_"):
+    """Convert a list of strings to a single string with a separator."""
+    return sep.join(lst)
 
 # Define a custom JSON encoder to handle NumPy types
 class NumpyJSONEncoder(json.JSONEncoder):
@@ -47,7 +64,7 @@ class NumpyJSONEncoder(json.JSONEncoder):
 class Args:
     # Hardware parameters
     left_camera_id: str = "25455306" # e.g., "24259877"
-    right_camera_id: str = "23007103" # fix: "27085680"  move: # "26368109"  
+    right_camera_id: str = "27085680" # fix: "27085680"  move: # "26368109"  
     wrist_camera_id: str = "14436910"  # e.g., "13062452"
 
     # Policy parameters
@@ -69,6 +86,10 @@ class Args:
 
     # Evaluation parameters
     eval_name: str = "default"  # Name for this evaluation session
+
+    # Video
+    superimpose_instruction: bool = True
+    instruction_frequency: int = 50 # How often to ask user for new instruction
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -106,6 +127,7 @@ def save_visualization_snapshot(fig, save_path):
 
 
 def main(args: Args):
+    print("Warning: using defualt value of RobotEnv's reset_pos")
     print("Entered main!")
     # Make sure external camera is specified by user -- we only use one external camera for the policy
     assert (
@@ -114,7 +136,6 @@ def main(args: Args):
 
     # Initialize the Panda environment. Using joint velocity action space and gripper position action space is very important.
     env = RobotEnv(action_space="joint_velocity", gripper_action_space="position")
-    print("Created the droid env!")
 
     # Connect to the policy server
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
@@ -127,8 +148,9 @@ def main(args: Args):
     main_category = input("Enter main category for this evaluation session: ")
     os.makedirs(f"results/log/{date}", exist_ok=True)
     markdown_file = f"results/log/{date}/eval_{main_category}.md"
-    os.makedirs(f"results/log/{date}/action_plot/{main_category}", exist_ok=True)
-    os.makedirs(f"results/log/{date}/action_json/{main_category}", exist_ok=True)
+    os.makedirs(f"results/log/{date}/action_plot", exist_ok=True)
+    os.makedirs(f"results/log/{date}/action_json", exist_ok=True)
+
 
     # Create markdown header
     with open(markdown_file, "a") as f:
@@ -146,9 +168,12 @@ def main(args: Args):
         # Prepare to save video of rollout
         timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
 
+        joint_position_file = f"results/log/{date}/eval_{main_category}_{timestamp}_joints.csv"
         # Create a filename-safe version of the instruction
-        safe_instruction = instruction.replace(" ", "_").replace("/", "_").replace("\\", "_")[:50]  # limit length
+        safe_instruction = instruction.replace(" ", "_").replace("/", "_").replace("\\", "_")
         video = []
+        # Added so we can keep track of instruction changing over time.
+        instructions = []
         wrist_video = []  # New list for wrist camera frames
         
         # Add data storage for plotting and JSON history
@@ -206,6 +231,13 @@ def main(args: Args):
         action_ydata = [[] for _ in range(8)]  # 8th is gripper
         gripper_action_ydata = []
         gripper_position_ydata = []
+        early_stop_markers = []  # Store early stop timesteps
+        
+        # Track early stopping state
+        is_early_stopped = False  # Current state
+        early_stop_regions = []  # List of (start, end) tuples
+        early_stop_start = None  # Start of current early stop region
+        consecutive_stops = 0  # Counter for consecutive stopped frames
         
         plt.tight_layout()
         plt.show(block=False)
@@ -214,39 +246,30 @@ def main(args: Args):
         start_time = time.time()
 
         bar = tqdm.tqdm(range(args.max_timesteps))
-        print("Running rollout... press Ctrl+C to stop early.")
+        print("Running rollout... press Ctrl+C to stop early (or manually change prompt)")
         for t_step in bar:
+            if t_step > 0 and t_step % args.instruction_frequency == 0:
+                new_instruction = input("Enter new instruction: (enter '' to keep current instruction). To provide empty string as intr, enter '<empty>' ")
+                if new_instruction == '':
+                    instruction = instruction
+                elif new_instruction == '<empty>':
+                    instruction = ''
+                elif new_instruction == 'zzz':
+                    print("Ending episode!")
+                    break
+                else:
+                    instruction = new_instruction
+                    print(f"Switching to instruction '{instruction}'")
             try:
                 curr_obs = _extract_observation(
                     args,
                     env.get_observation(),
                     save_to_disk=t_step == 0,
-                    main_category=main_category,
-                    instruction=instruction,
-                    date=date,
                 )
                 # Save both camera views
-                # Add instruction text to external camera image
-                camera_image = curr_obs[f"{args.external_camera}_image"].copy()
-                
-                display_text = instruction[:50] + "..." if len(instruction) > 50 else instruction
-                text_position = (10, 30)  
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1.2
-                font_color = (255, 255, 255)   
-                font_thickness = 2
-                
-                # Add black outline/shadow for better visibility against any background
-                cv2.putText(camera_image, display_text, text_position, font, font_scale, 
-                           (0, 0, 0), font_thickness + 2)
-                
-                # Draw the main text in white
-                cv2.putText(camera_image, display_text, text_position, font, font_scale, 
-                           font_color, font_thickness)
-                
-                video.append(camera_image)
-                
+                video.append(curr_obs[f"{args.external_camera}_image"])
                 wrist_video.append(curr_obs["wrist_image"])
+                instructions.append(instruction)
                 
                 # Store joint positions for visualization
                 joint_positions.append(curr_obs["joint_position"])
@@ -255,6 +278,7 @@ def main(args: Args):
                 if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                     actions_from_chunk_completed = 0
                     current_chunk_index += 1
+
                     # We resize images on the robot laptop to minimize the amount of data sent to the policy server
                     # and improve latency.
                     request_data = {
@@ -307,6 +331,28 @@ def main(args: Args):
                 # clip all dimensions of action to [-1, 1]
                 action = np.clip(action, -1, 1)
                 
+                # Check for "early stopping" pattern - when all joint velocities are zero
+                joint_velocities = action[:-1]  # All except gripper
+                is_current_stopped = bool(np.all(np.abs(joint_velocities) < 1e-2))  # Convert numpy.bool_ to Python bool
+                
+                if is_current_stopped:
+                    consecutive_stops += 1
+                    early_stop_markers.append(t_step)
+                    
+                    # If this is the start of a new stopping region
+                    if not is_early_stopped and consecutive_stops == 1:
+                        is_early_stopped = True
+                        early_stop_start = t_step
+                        print(f"Early stopping began at timestep {early_stop_start}")
+                else:
+                    # If we were in an early stopped state but now there's movement
+                    if is_early_stopped:
+                        is_early_stopped = False
+                        early_stop_end = t_step - 1
+                        early_stop_regions.append((early_stop_start, early_stop_end))
+                        print(f"Early stopping ended at timestep {early_stop_end}, duration: {early_stop_end - early_stop_start + 1} steps")
+                    consecutive_stops = 0
+                
                 # Store action for history and visualization
                 action_record = {
                     "timestep": t_step,
@@ -315,7 +361,9 @@ def main(args: Args):
                     "action_index_in_chunk": actions_from_chunk_completed - 1,
                     "action": action.tolist(),
                     "joint_position": curr_obs["joint_position"].tolist(),
-                    "gripper_position": curr_obs["gripper_position"].tolist()
+                    "gripper_position": curr_obs["gripper_position"].tolist(),
+                    "is_early_stop": is_current_stopped,
+                    "instruction": instruction
                 }
                 action_history.append(action_record)
                 
@@ -350,12 +398,40 @@ def main(args: Args):
                     gripper_action_line.set_data(xdata, gripper_action_ydata)
                     gripper_position_line.set_data(xdata, gripper_position_ydata)
                     
+                    # Update early stop markers
+                    for ax in axs:
+                        # Clear any existing early stop markers
+                        for artist in ax.findobj(match=lambda x: hasattr(x, 'early_stop_marker')):
+                            artist.remove()
+                    
+                    # Add new markers for early stops
+                    for stop_time in early_stop_markers:
+                        for ax in axs:
+                            marker = ax.axvline(x=stop_time, color='green', linestyle='-.', linewidth=1, alpha=0.2)
+                            marker.early_stop_marker = True  # Tag it for later removal
+                    
+                    # Add shaded regions for completed early stopping periods
+                    for region in early_stop_regions:
+                        start, end = region
+                        for ax in axs:
+                            rect = ax.axvspan(start, end, color='green', alpha=0.1)
+                            rect.early_stop_marker = True
+                    
+                    # Add shaded region for current early stopping period (if any)
+                    if is_early_stopped and early_stop_start is not None:
+                        for ax in axs:
+                            rect = ax.axvspan(early_stop_start, t_step, color='green', alpha=0.1)
+                            rect.early_stop_marker = True
+                    
                     # Update status text
                     current_time = time.time() - start_time
                     status_text.set_text(f"Timestep: {t_step}\n"
                                         f"Time: {current_time:.2f}s\n"
                                         f"Chunk: {current_chunk_index}\n"
-                                        f"Action in chunk: {actions_from_chunk_completed-1}/8\n")
+                                        f"Action in chunk: {actions_from_chunk_completed-1}/8\n"
+                                        f"Early stops: {len(early_stop_markers)}\n"
+                                        f"Stop regions: {len(early_stop_regions)}" +
+                                        (f"\nCurrent stop: {consecutive_stops}" if is_early_stopped else ""))
                     
                     # Rescale axes
                     for ax in axs:
@@ -368,20 +444,113 @@ def main(args: Args):
 
                 env.step(action) # droid actually apply the action
             except KeyboardInterrupt:
-                break
+                instruction = input("Enter 'zzz' to end episode. Otherwise, enter new instruction to continue: ")
+                if instruction == 'zzz':
+                    print("Ending episode!")
+                    break
+                else:
+                    print(f"Switching to instruction '{instruction}'")
+                    continue
 
         # Final execution time
         total_execution_time = time.time() - start_time
         
+        # Complete any ongoing early stopping period
+        if is_early_stopped and early_stop_start is not None:
+            early_stop_regions.append((early_stop_start, t_step))
+            print(f"Final early stopping period ended at the end of experiment, duration: {t_step - early_stop_start + 1} steps")
+        
+        # Analyze early stopping patterns
+        if early_stop_markers:
+            # Complete any ongoing early stopping period
+            if is_early_stopped and early_stop_start is not None:
+                early_stop_regions.append((early_stop_start, t_step))
+                print(f"Final early stopping period ended at the end of experiment, duration: {t_step - early_stop_start + 1} steps")
+            
+            # Process early stopping regions data
+            region_durations = [end - start + 1 for start, end in early_stop_regions]
+            total_stopped_frames = sum(region_durations)
+            
+            # Count early stops at the beginning of chunks
+            beginning_chunk_stops = sum(1 for t in early_stop_markers 
+                                      if t in chunk_timestamps)
+            
+            # Count early stops at the end of chunks
+            chunk_end_stops = 0
+            for i, chunk_start in enumerate(chunk_timestamps):
+                if i < len(chunk_timestamps)-1:
+                    # Check if stop happened just before next chunk
+                    chunk_end = chunk_timestamps[i+1] - 1
+                    chunk_end_stops += sum(1 for t in early_stop_markers 
+                                         if t == chunk_end)
+                else:
+                    # Last chunk
+                    pass
+            
+            print("\nEarly stopping analysis:")
+            print(f"  Total early stopped frames: {len(early_stop_markers)}")
+            print(f"  Number of continuous stopping regions: {len(early_stop_regions)}")
+            if early_stop_regions:
+                avg_duration = total_stopped_frames / len(early_stop_regions)
+                max_duration = max(region_durations)
+                min_duration = min(region_durations)
+                print(f"  Average region duration: {avg_duration:.1f} frames")
+                print(f"  Longest region: {max_duration} frames")
+                print(f"  Shortest region: {min_duration} frames")
+                
+                # Find the longest stopping region
+                longest_idx = region_durations.index(max_duration)
+                longest_start, longest_end = early_stop_regions[longest_idx]
+                print(f"  Longest stopping region: frames {longest_start}-{longest_end}")
+                
+                # Calculate percentage of experiment spent in stopping state
+                stopping_percentage = (total_stopped_frames / (t_step + 1)) * 100
+                print(f"  Experiment time in stopped state: {stopping_percentage:.1f}%")
+            
+            print(f"  Stops at chunk beginnings: {beginning_chunk_stops} frames")
+            print(f"  Stops at chunk ends: {chunk_end_stops} frames")
+            
+            # Look at positions within chunks
+            chunk_positions = {}
+            for t in early_stop_markers:
+                # Find which chunk this belongs to
+                chunk_idx = -1
+                pos_in_chunk = -1
+                for i, chunk_start in enumerate(chunk_timestamps):
+                    if i < len(chunk_timestamps)-1:
+                        if chunk_start <= t < chunk_timestamps[i+1]:
+                            chunk_idx = i
+                            pos_in_chunk = t - chunk_start
+                            break
+                    else:
+                        # Last chunk
+                        if chunk_start <= t:
+                            chunk_idx = i
+                            pos_in_chunk = t - chunk_start
+                
+                if pos_in_chunk != -1:
+                    if pos_in_chunk not in chunk_positions:
+                        chunk_positions[pos_in_chunk] = 0
+                    chunk_positions[pos_in_chunk] += 1
+            
+            print("\nPositions within chunks where early stops occur:")
+            for pos, count in sorted(chunk_positions.items()):
+                print(f"  Position {pos}: {count} frames ({count/len(early_stop_markers)*100:.1f}%)")
+        
+
+        deduplicated_instructions = deduplicated_list(instructions)
+        instructions_str = list_to_str(deduplicated_instructions)
+        instructions_str = instructions_str.replace(" ", "_").replace("/", "_").replace("\\", "_")
+
         # Save a snapshot of the visualization before closing
-        vis_snapshot_path = f"results/log/{date}/action_plot/{main_category}/eval_{instruction}_visualization_{timestamp}.png"
+        vis_snapshot_path = f"results/log/{date}/action_plot/eval_{main_category}_{instructions_str}_visualization.png"
         save_visualization_snapshot(fig, vis_snapshot_path)
         
         # Close the plot after the rollout
         plt.close(fig)
         
         # Save action trunk history to JSON
-        action_history_file = f"results/log/{date}/action_json/{main_category}/eval_{instruction}_action_history_{timestamp}.json"
+        action_history_file = f"results/log/{date}/action_json/eval_{main_category}_{instructions_str}_action_history.json"
         
         # Include all relevant metadata
         action_history_data = {
@@ -402,6 +571,15 @@ def main(args: Args):
             },
             "action_chunks": action_chunks_history,
             "chunk_timestamps": [int(t) for t in chunk_timestamps],
+            "early_stops": {
+                "count": len(early_stop_markers),
+                "timesteps": [int(t) for t in early_stop_markers],  # Ensure these are native Python ints
+                "regions": [{"start": int(start), "end": int(end), "duration": int(end - start + 1)} 
+                          for start, end in early_stop_regions],
+                "total_regions": len(early_stop_regions),
+                "total_stopped_frames": sum(end - start + 1 for start, end in early_stop_regions) if early_stop_regions else 0,
+                "threshold": float(1e-2)  # Ensure this is a native Python float
+            },
             "detailed_actions": action_history
         }
         
@@ -409,6 +587,9 @@ def main(args: Args):
             json.dump(action_history_data, f, indent=2, cls=NumpyJSONEncoder)
         
         print(f"Action trunk history saved to {action_history_file}")
+
+        
+
 
         # Stack videos side by side
         video = np.stack(video)
@@ -422,15 +603,44 @@ def main(args: Args):
         video_resized = np.array([image_tools.resize_with_pad(frame, target_height, target_width) for frame in video])
         wrist_video_resized = np.array([image_tools.resize_with_pad(frame, target_height, target_width) for frame in wrist_video])
         
+        
+
         # Stack videos horizontally
         combined_video = np.concatenate([video_resized, wrist_video_resized], axis=2)
 
+
+        if args.superimpose_instruction:
+            assert len(combined_video) == len(instructions), f"Got {len(combined_video)} frames but {len(instructions)} instructions."
+            for instr_i, instr in enumerate(instructions):
+                # Convert frame from RGB to BGR (OpenCV uses BGR)
+                frame_bgr = cv2.cvtColor(combined_video[instr_i], cv2.COLOR_RGB2BGR)
+
+                # Put text on frame
+                cv2.putText(
+                    frame_bgr,
+                    instr,
+                    org=(10, 30),  # x, y position of text
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=1,
+                    color=(255, 255, 255),  # white text
+                    thickness=2,
+                    lineType=cv2.LINE_AA
+                )
+
+                # Convert back to RGB
+                combined_video[instr_i] = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+
+
         date = datetime.datetime.now().strftime("%m%d")
-        save_dir = f"results/videos/{date}/{main_category}"
+        save_dir = f"results/videos/{date}"
         os.makedirs(save_dir, exist_ok=True)
-        save_filename = os.path.join(save_dir, f"{args.external_camera }_{safe_instruction}_{timestamp}.mp4")
-  
-        ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename, codec="libx264")
+        save_filename = os.path.join(save_dir, f"{args.external_camera }_{instructions_str}_{timestamp}.mp4")
+        ImageSequenceClip(list(combined_video), fps=10).write_videofile(save_filename + ".mp4", codec="libx264")
+        ImageSequenceClip(list(video), fps=10).write_videofile(save_filename + "_external.mp4", codec="libx264")
+        ImageSequenceClip(list(wrist_video), fps=10).write_videofile(save_filename + "_wrist.mp4", codec="libx264")
+        
+
 
         # Get success value
         success: str | float | None = None
@@ -459,7 +669,7 @@ def main(args: Args):
 
         # Append to markdown file
         with open(markdown_file, "a") as f:
-            f.write(f"### Trial {len(df) + 1}: {instruction}\n")
+            f.write(f"### Trial {len(df) + 1}: {instructions_str}\n")
             f.write(f"- Success: {success * 100}%\n")
             f.write(f"- Duration: {t_step} steps\n")
             f.write(f"- Video: [{os.path.basename(save_filename)}]({save_filename})\n")
@@ -485,7 +695,7 @@ def main(args: Args):
     print(f"Results saved to {markdown_file} and {csv_filename}")
 
 
-def _extract_observation(args: Args, obs_dict, *, save_to_disk=False, main_category=None, instruction=None, date=None):
+def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
     image_observations = obs_dict["image"]
     left_image, right_image, wrist_image = None, None, None
     for key in image_observations:
@@ -520,8 +730,6 @@ def _extract_observation(args: Args, obs_dict, *, save_to_disk=False, main_categ
         combined_image = np.concatenate([left_image, wrist_image, right_image], axis=1)
         combined_image = Image.fromarray(combined_image)
         combined_image.save("robot_camera_views.png")
-        
-        combined_image.save(f"results/log/{date}/view_{main_category}_{instruction}.png")
 
     return {
         "left_image": left_image,
@@ -536,3 +744,32 @@ def _extract_observation(args: Args, obs_dict, *, save_to_disk=False, main_categ
 if __name__ == "__main__":
     args: Args = tyro.cli(Args)
     main(args)
+
+#### Way to save images without cv2
+'''from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+
+# Stack videos horizontally
+combined_video = np.concatenate([video_resized, wrist_video_resized], axis=2)
+
+if args.superimpose_instruction:
+    assert len(combined_video) == len(instructions), f"Got {len(combined_video)} frames but {len(instructions)} instructions."
+
+    for instr_i, instr in enumerate(instructions):
+        # Convert NumPy array to PIL Image
+        frame = Image.fromarray(combined_video[instr_i])
+
+        # Create drawing context
+        draw = ImageDraw.Draw(frame)
+
+        # Choose a font (adjust path or use default)
+        try:
+            font = ImageFont.truetype("arial.ttf", 24)  # Change path/font as needed
+        except IOError:
+            font = ImageFont.load_default()
+
+        # Draw text
+        draw.text((10, 10), instr, font=font, fill=(255, 255, 255))  # White text
+
+        # Convert back to NumPy array
+        combined_video[instr_i] = np.array(frame)'''
