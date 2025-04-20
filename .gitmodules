@@ -4,3 +4,6 @@
 [submodule "droid/fairo"]
 	path = droid/fairo
 	url = https://github.com/facebookresearch/fairo.git
+[submodule "real_eval"]
+	path = real_eval
+	url = https://github.com/penn-pal-lab/real_eval.git

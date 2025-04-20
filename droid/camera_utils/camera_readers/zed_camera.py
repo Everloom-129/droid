@@ -3,7 +3,7 @@ from copy import deepcopy
 import cv2
 import numpy as np
 
-from droid.misc.parameters import hand_camera_id
+from droid.misc.parameters import hand_camera_id, camera_flip_dict
 from droid.misc.time import time_ms
 
 try:
@@ -28,14 +28,6 @@ def gather_zed_cameras():
 
 resize_func_map = {"cv2": cv2.resize, None: None}
 
-standard_params = dict(
-    depth_minimum_distance=0.1, camera_resolution=sl.RESOLUTION.HD720, depth_stabilization=False, camera_fps=60, camera_image_flip=sl.FLIP_MODE.OFF
-)
-
-advanced_params = dict(
-    depth_minimum_distance=0.1, camera_resolution=sl.RESOLUTION.HD2K, depth_stabilization=False, camera_fps=15, camera_image_flip=sl.FLIP_MODE.OFF
-)
-
 
 class ZedCamera:
     def __init__(self, camera):
@@ -46,6 +38,17 @@ class ZedCamera:
         self.current_mode = None
         self._current_params = None
         self._extriniscs = {}
+
+        flip = sl.FLIP_MODE.ON if camera_flip_dict[self.serial_number] else sl.FLIP_MODE.OFF
+        print(camera_flip_dict[self.serial_number], flip)
+        self.standard_params = dict(
+            depth_minimum_distance=200, depth_mode = sl.DEPTH_MODE.NEURAL, camera_resolution=sl.RESOLUTION.HD720, depth_stabilization=False, camera_fps=60, camera_image_flip=flip,
+            camera_disable_self_calib=True
+        )
+        self.advanced_params = dict(
+            depth_minimum_distance=200, camera_resolution=sl.RESOLUTION.HD2K, depth_stabilization=False, camera_fps=15, camera_image_flip=flip,
+            camera_disable_self_calib=True
+        )
 
         # Open Camera #
         print("Opening Zed: ", self.serial_number)
@@ -85,12 +88,12 @@ class ZedCamera:
         self.resizer_resolution = (0, 0)
 
         # Set Mode #
-        change_settings_1 = (self.high_res_calibration) and (self._current_params != advanced_params)
-        change_settings_2 = (not self.high_res_calibration) and (self._current_params != standard_params)
+        change_settings_1 = (self.high_res_calibration) and (self._current_params != self.advanced_params)
+        change_settings_2 = (not self.high_res_calibration) and (self._current_params != self.standard_params)
         if change_settings_1:
-            self._configure_camera(advanced_params)
+            self._configure_camera(self.advanced_params)
         if change_settings_2:
-            self._configure_camera(standard_params)
+            self._configure_camera(self.standard_params)
         self.current_mode = "calibration"
 
     def set_trajectory_mode(self):
@@ -107,9 +110,9 @@ class ZedCamera:
             self.resizer_resolution = self.traj_resolution
 
         # Set Mode #
-        change_settings = self._current_params != standard_params
+        change_settings = self._current_params != self.standard_params
         if change_settings:
-            self._configure_camera(standard_params)
+            self._configure_camera(self.standard_params)
         self.current_mode = "trajectory"
 
     def _configure_camera(self, init_params):
@@ -131,7 +134,7 @@ class ZedCamera:
         self._current_params = init_params
         sl_params = sl.InitParameters(**init_params)
         sl_params.set_from_serial_number(int(self.serial_number))
-        sl_params.camera_image_flip = sl.FLIP_MODE.OFF
+        sl_params.camera_image_flip = sl.FLIP_MODE.ON if camera_flip_dict[self.serial_number] else sl.FLIP_MODE.OFF
         status = self._cam.open(sl_params)
         if status != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError("Camera Failed To Open")
@@ -156,7 +159,7 @@ class ZedCamera:
 
     ### Recording Utilities ###
     def start_recording(self, filename):
-        assert filename.endswith(".svo")
+        assert filename.endswith(".svo2")
         recording_param = sl.RecordingParameters(filename, sl.SVO_COMPRESSION_MODE.H265)
         err = self._cam.enable_recording(recording_param)
         assert err == sl.ERROR_CODE.SUCCESS
@@ -180,6 +183,7 @@ class ZedCamera:
         timestamp_dict = {self.serial_number + "_read_start": time_ms()}
         err = self._cam.grab(self._runtime)
         if err != sl.ERROR_CODE.SUCCESS:
+            print(f"ERROR: Camera {self.serial_number} failed to read!")
             return None
         timestamp_dict[self.serial_number + "_read_end"] = time_ms()
 
@@ -201,19 +205,21 @@ class ZedCamera:
                 data_dict["image"] = {
                     self.serial_number + "_left": self._process_frame(self._left_img),
                     self.serial_number + "_right": self._process_frame(self._right_img),
-                }
-        # if self.depth:
-        # 	self._cam.retrieve_measure(self._left_depth, sl.MEASURE.DEPTH, resolution=self.resolution)
-        # 	self._cam.retrieve_measure(self._right_depth, sl.MEASURE.DEPTH_RIGHT, resolution=self.resolution)
-        # 	data_dict['depth'] = {
-        # 		self.serial_number + '_left': self._left_depth.get_data().copy(),
-        # 		self.serial_number + '_right': self._right_depth.get_data().copy()}
-        # if self.pointcloud:
-        # 	self._cam.retrieve_measure(self._left_pointcloud, sl.MEASURE.XYZRGBA, resolution=self.resolution)
-        # 	self._cam.retrieve_measure(self._right_pointcloud, sl.MEASURE.XYZRGBA_RIGHT, resolution=self.resolution)
-        # 	data_dict['pointcloud'] = {
-        # 		self.serial_number + '_left': self._left_pointcloud.get_data().copy(),
-        # 		self.serial_number + '_right': self._right_pointcloud.get_data().copy()}
+                }        
+        if self.depth:
+            self._cam.retrieve_measure(self._left_depth, sl.MEASURE.DEPTH, resolution=self.zed_resolution)
+            # self._cam.retrieve_measure(self._right_depth, sl.MEASURE.DEPTH_RIGHT, resolution=self.zed_resolution)
+            data_dict['depth'] = {
+                self.serial_number + '_left': self._left_depth.get_data().copy(),
+                # self.serial_number + '_right': self._right_depth.get_data().copy()
+            }
+        if self.pointcloud:
+            self._cam.retrieve_measure(self._left_pointcloud, sl.MEASURE.XYZRGBA, resolution=self.zed_resolution)
+        	# self._cam.retrieve_measure(self._right_pointcloud, sl.MEASURE.XYZRGBA_RIGHT, resolution=self.zed_resolution)
+            data_dict['pointcloud'] = {
+                self.serial_number + '_left': self._left_pointcloud.get_data().copy(),
+                # self.serial_number + '_right': self._right_pointcloud.get_data().copy()
+            }
 
         return data_dict, timestamp_dict
 
